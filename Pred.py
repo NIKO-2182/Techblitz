@@ -1,9 +1,10 @@
 from flask import Flask, request, jsonify, Blueprint
+from werkzeug.utils import secure_filename
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
 import os
-from Techblitz.Visual.previsual import load_and_prepare_data
+from tabula.io import read_pdf
 from Techblitz.Visual.Arima import train_all_metrics
 from Techblitz.Visual.Postvisual import (
     adjust_predictions, 
@@ -15,23 +16,48 @@ from Techblitz.Visual.Postvisual import (
 app = Flask(__name__)
 analysis = Blueprint("analysis", __name__, url_prefix="/api")
 
-@analysis.route("/analyze", methods=["POST"])
-def analyze_financial_data():
-    """API endpoint for financial analysis"""
-    try:
-        # Validate request data
-        if 'file' not in request.files:
-            return jsonify({
-                'error': 'No file uploaded',
-                'status': 400
-            }), 400
+# Configure upload settings
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'pdf', 'csv'}
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({
-                'error': 'No file selected',
-                'status': 400
-            }), 400
+def allowed_file(filename):
+    """Check if file extension is allowed"""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def process_financial_data(file_path):
+    """Process uploaded financial data file"""
+    try:
+        # Load data based on file type
+        if file_path.lower().endswith('.pdf'):
+            tables = read_pdf(file_path, pages='all')
+            if not tables:
+                raise ValueError("No tables found in PDF")
+            data = tables[0]
+        else:
+            data = pd.read_csv(file_path)
+
+        # Validate required columns
+        required_columns = [
+            'Date', 'Inflation_Rate', 'Interest_Rate',
+            'Revenue_Growth', 'Profit_Margin', 'Cash_Flow'
+        ]
+        
+        missing_cols = [col for col in required_columns if col not in data.columns]
+        if missing_cols:
+            raise ValueError(f"Missing columns: {', '.join(missing_cols)}")
+
+        # Process data
+        data['Date'] = pd.to_datetime(data['Date'])
+        data = data.set_index('Date')
+        
+        # Convert numeric columns
+        numeric_cols = data.columns.difference(['Date'])
+        data[numeric_cols] = data[numeric_cols].apply(pd.to_numeric, errors='coerce')
+        
+        if data.isnull().any().any():
+            raise ValueError("Dataset contains missing values")
 
         # Get user parameters
         try:
@@ -41,29 +67,21 @@ def analyze_financial_data():
                 'Growth_Factor': float(request.form.get('growth_factor', 1))
             }])
         except ValueError:
-            return jsonify({
-                'error': 'Invalid parameter values',
-                'status': 400
-            }), 400
+            raise ValueError("Invalid parameter values")
 
-        # Read and process file
-        file_data = file.read()
-        data, viz_files = load_and_prepare_data(file_data)
-        
-        if data is None:
-            return jsonify({
-                'error': 'Failed to load data',
-                'status': 500
-            }), 500
+        # Validate parameters
+        if not (0 <= user_params['Growth_Factor'].values[0] <= 2):
+            raise ValueError("Growth Factor must be between 0 and 2")
+        if user_params['Inflation_Rate'].values[0] < 0:
+            raise ValueError("Inflation Rate cannot be negative")
+        if user_params['Interest_Rate'].values[0] < 0:
+            raise ValueError("Interest Rate cannot be negative")
 
-        # Define metrics
+        # Process predictions
         targets = ['Revenue_Growth', 'Profit_Margin', 'Cash_Flow']
-        
-        # Train models and get predictions
         results_dict = train_all_metrics(data, targets)
         predictions_summary = []
 
-        # Process predictions for each metric
         for target in targets:
             original_pred = results_dict[target]['predictions'][-1]
             adjusted_pred = adjust_predictions(
@@ -78,10 +96,10 @@ def analyze_financial_data():
             )
             predictions_summary.append(prediction_info)
 
-        # Generate prediction visualizations
-        pred_viz_files = visualize_predictions(predictions_summary)
+        # Generate visualizations
+        viz_files = visualize_predictions(predictions_summary)
 
-        # Save predictions to CSV
+        # Save results
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         results_dir = 'results'
         if not os.path.exists(results_dir):
@@ -93,16 +111,66 @@ def analyze_financial_data():
         return jsonify({
             'status': 200,
             'predictions': predictions_summary,
-            'visualizations': {
-                'data': viz_files,
-                'predictions': pred_viz_files
-            },
+            'visualizations': viz_files,
             'file_saved': filename
         })
 
     except Exception as e:
+        raise ValueError(f"Data processing failed: {str(e)}")
+
+@analysis.route("/analyze", methods=["POST"])
+def analyze_financial_data():
+    """API endpoint for financial analysis"""
+    try:
+        # Ensure upload directory exists
+        if not os.path.exists(app.config['UPLOAD_FOLDER']):
+            os.makedirs(app.config['UPLOAD_FOLDER'])
+
+        # Validate file upload
+        if 'file' not in request.files:
+            return jsonify({
+                'error': 'No file part in request',
+                'details': 'Include file in form data with key "file"',
+                'status': 400
+            }), 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({
+                'error': 'No file selected',
+                'details': 'Select a file before uploading',
+                'status': 400
+            }), 400
+
+        if not allowed_file(file.filename):
+            return jsonify({
+                'error': 'Invalid file type',
+                'details': f'Allowed types: {", ".join(ALLOWED_EXTENSIONS)}',
+                'status': 400
+            }), 400
+
+        # Save and process file
+        try:
+            filename = secure_filename(file.filename)
+            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(file_path)
+            
+            return process_financial_data(file_path)
+            
+        except ValueError as e:
+            return jsonify({
+                'error': 'Processing failed',
+                'details': str(e),
+                'status': 400
+            }), 400
+        finally:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+    except Exception as e:
         return jsonify({
-            'error': str(e),
+            'error': 'Server error',
+            'details': str(e),
             'status': 500
         }), 500
 
@@ -113,15 +181,10 @@ if __name__ == "__main__":
     print("\n🚀 Starting Financial Analysis API...")
     print("=" * 50)
     print("📍 Endpoint: http://localhost:5003/api/analyze")
-    print("📁 Accepts: CSV/PDF file upload")
+    print("📁 Accepts: PDF/CSV upload (max 16MB)")
     print("📊 Parameters:")
-    print("  • inflation_rate (float)")
-    print("  • interest_rate (float)")
-    print("  • growth_factor (float)")
-    print("\n💾 Outputs:")
-    print("  • Prediction results (JSON)")
-    print("  • Data visualizations (PNG)")
-    print("  • Prediction visualizations (PNG)")
-    print("  • Results summary (CSV)")
+    print("  • inflation_rate (float, >= 0)")
+    print("  • interest_rate (float, >= 0)")
+    print("  • growth_factor (float, 0-2)")
     print("=" * 50)
     app.run(host="0.0.0.0", port=5003, debug=True)
